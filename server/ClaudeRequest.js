@@ -48,7 +48,6 @@ class ClaudeRequest {
   constructor(req = null) {
     this.API_URL = 'https://api.anthropic.com/v1/messages';
     this.VERSION = '2023-06-01';
-    this.BETA_HEADER = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14';
 
     const apiKey = req?.headers?.['x-api-key'];
     if (apiKey && apiKey.includes('sk-ant')) {
@@ -320,13 +319,9 @@ class ClaudeRequest {
       'Content-Type': 'application/json',
       'Authorization': token,
       'anthropic-version': this.VERSION,
-      'User-Agent': 'claude-code-proxy/1.0.0'
+      'User-Agent': 'claude-code-proxy/1.0.0',
+      'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11'
     };
-
-    if (this.BETA_HEADER) {
-      headers['anthropic-beta'] = this.BETA_HEADER;
-    }
-
     return headers;
   }
 
@@ -568,7 +563,7 @@ class ClaudeRequest {
       });
 
       claudeResponse.on('end', () => {
-        Logger.debug(`Non-streaming response (${claudeResponse.statusCode}): ${responseData.substring(0, 500)}`);
+        Logger.debug(`Non-streaming response (${claudeResponse.statusCode}): ${responseData.substring(0, 25000)}`);
         try {
           const jsonData = JSON.parse(responseData);
           res.setHeader('Content-Type', 'application/json');
