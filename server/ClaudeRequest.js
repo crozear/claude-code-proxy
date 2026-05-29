@@ -6,7 +6,7 @@ const { execSync } = require('child_process');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 
-const STRIP_TTL = true;
+const STRIP_TTL = false;
 const TOKEN_REFRESH_METHOD = 'OAUTH'; // 'OAUTH' or 'CLAUDE_CODE_CLI'
 
 // Load configuration
@@ -320,7 +320,7 @@ class ClaudeRequest {
       'Authorization': token,
       'anthropic-version': this.VERSION,
       'User-Agent': 'claude-code-proxy/1.0.0',
-      'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11'
+      'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11,task-budgets-2026-03-13'
     };
     return headers;
   }
