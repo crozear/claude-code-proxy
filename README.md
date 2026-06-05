@@ -7,7 +7,7 @@ Basically we can borrow Claude Code subscription authentication to make normal A
 
 There seems to be no safety injection and it gives us full control of the entire input, minus a tiny required sentence about being Claude Code in the system prompt (check What This Does section)
 
-Obviously this is probably not super cool in terms of ToS. But I'm not worried, historically they don't ban web subscribers unless there's VPN/location/sus email/payment shenanigans (as opposed to API which does get got occasionally).
+Obviously this is probably not super cool in terms of ToS. But I'm not worried, historically they don't ban web subscribers unless there's VPN/location/sus account/payment shenanigans (as opposed to API which does get got occasionally).
 
 **NEW:** This proxy now has **standalone OAuth authentication**! You no longer need to install Claude Code - just authenticate through your browser. Claude Code credentials are still supported as an optional fallback.
 
