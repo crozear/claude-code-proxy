@@ -410,7 +410,7 @@ class ClaudeRequest {
     const processedBody = this.processRequestBody(body, presetName);
 
     Logger.debug('Outgoing headers to Claude:', JSON.stringify(headers, null, 2));
-    Logger.debug(`Final request to Claude (${JSON.stringify(processedBody).length} bytes):`, JSON.stringify(processedBody, null, 2));
+    Logger.debug(`Final request to Claude (${JSON.stringify(processedBody).length} bytes): ${Logger.truncate(JSON.stringify(processedBody))}`);
 
     const urlParts = new URL(this.API_URL);
     const options = {
@@ -563,7 +563,7 @@ class ClaudeRequest {
       });
 
       claudeResponse.on('end', () => {
-        Logger.debug(`Non-streaming response (${claudeResponse.statusCode}): ${responseData.substring(0, 25000)}`);
+        Logger.debug(`Non-streaming response (${claudeResponse.statusCode}): ${Logger.truncate(responseData)}`);
         try {
           const jsonData = JSON.parse(responseData);
           res.setHeader('Content-Type', 'application/json');

@@ -260,7 +260,7 @@ async function handleRequest(req, res) {
     try {
       Logger.debug('Incoming request headers:', JSON.stringify(req.headers, null, 2));
       const body = await parseBody(req);
-      Logger.debug(`Claude request body (${JSON.stringify(body).length} bytes):`, JSON.stringify(body, null, 2));
+      Logger.debug(`Claude request body (${JSON.stringify(body).length} bytes): ${Logger.truncate(JSON.stringify(body))}`);
       
       let presetName = null;
       const presetMatch = pathname.match(/^\/v1\/(\w+)\/messages$/);
