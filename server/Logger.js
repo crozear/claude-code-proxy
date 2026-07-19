@@ -34,6 +34,17 @@ class Logger {
     console.error('ERROR:', ...args);
   }
 
+  // Clamp a value to a single, bounded log line. Docker's json-file/local
+  // driver splits any log line longer than 16384 bytes and stamps the
+  // continuation with a fresh RFC3339Nano timestamp — which is how a Docker
+  // timestamp ended up smeared into a dumped request/response. Keep the
+  // default well under 16 KB so a prefix + multibyte chars still fit.
+  static truncate(value, max = 16000) {
+    const str = typeof value === 'string' ? value : String(value);
+    if (str.length <= max) return str;
+    return `${str.slice(0, max)}… [+${str.length - max} more chars]`;
+  }
+
   static createDebugStream(label = 'Stream chunk', textExtractor = null) {
     if (this.getLogLevel() < 3) {
       return new Transform({
@@ -43,51 +54,59 @@ class Logger {
       });
     }
 
+    // Keep every emitted line a single, prefixed, newline-terminated record
+    // that stays under Docker's 16 KB split. The old version echoed raw,
+    // newline-less response tokens straight to process.stdout, so Docker
+    // buffered the whole reply into one giant line and chopped it every
+    // 16384 bytes — injecting a timestamp into the echoed copy and smearing
+    // it across the INFO:/DEBUG: lines. We now accumulate and emit one framed
+    // summary at end-of-stream instead.
+    const logLevel = this.getLogLevel();
+    const PREVIEW_LIMIT = 2000;
     let streamingText = '';
     let thinkingText = '';
     let hasStartedStreaming = false;
-    let hasStartedResponse = false;
-    const logLevel = this.getLogLevel();
-    
+
     return new Transform({
       transform(chunk, encoding, callback) {
         try {
           const chunkStr = chunk.toString();
-          
+
+          // TRACE: every chunk, but bounded so one chunk can't trip the split.
           if (logLevel >= 4) {
-            Logger.trace(`${label} (${chunkStr.length} bytes): ${chunkStr}`);
-          } else if (logLevel >= 3) {
-            if (textExtractor) {
-              const result = textExtractor(chunk);
-              if (result?.text) {
-                if (!hasStartedStreaming) {
-                  Logger.debug(`${label} streaming started`);
-                  hasStartedStreaming = true;
-                }
-                if (thinkingText && !hasStartedResponse) {
-                  process.stdout.write('\n');
-                  Logger.debug(`${label} switching from thinking to response`);
-                  hasStartedResponse = true;
-                }
-                streamingText += result.text;
-                process.stdout.write(result.text);
+            Logger.trace(`${label} (${chunkStr.length} bytes): ${Logger.truncate(chunkStr, PREVIEW_LIMIT)}`);
+          }
+
+          if (textExtractor) {
+            const result = textExtractor(chunk);
+            if (result?.text || result?.thinking) {
+              if (!hasStartedStreaming) {
+                Logger.debug(`${label} streaming started`);
+                hasStartedStreaming = true;
               }
-              if (result?.thinking) {
-                if (!hasStartedStreaming) {
-                  Logger.debug(`${label} streaming started`);
-                  hasStartedStreaming = true;
-                }
-                thinkingText += result.thinking;
-                process.stdout.write(`\x1b[90m${result.thinking}\x1b[0m`);
-              }
-            } else {
-              Logger.debug(`${label} (${chunkStr.length} bytes): ${chunkStr}`);
+              if (result.text) streamingText += result.text;
+              if (result.thinking) thinkingText += result.thinking;
             }
+          } else if (logLevel === 3) {
+            // DEBUG without an extractor: one framed, bounded line per chunk.
+            Logger.debug(`${label} (${chunkStr.length} bytes): ${Logger.truncate(chunkStr, PREVIEW_LIMIT)}`);
           }
         } catch (error) {
-          Logger.debug(`${label} (failed to decode):`, chunk);
+          Logger.debug(`${label} (failed to decode chunk)`);
         }
         callback(null, chunk);
+      },
+
+      flush(callback) {
+        // One framed summary in place of the raw token echo.
+        if (hasStartedStreaming) {
+          if (thinkingText) {
+            Logger.debug(`${label} thinking (${thinkingText.length} chars): ${Logger.truncate(thinkingText, PREVIEW_LIMIT)}`);
+          }
+          Logger.debug(`${label} response (${streamingText.length} chars): ${Logger.truncate(streamingText, PREVIEW_LIMIT)}`);
+          Logger.debug(`${label} streaming complete`);
+        }
+        callback();
       }
     });
   }
