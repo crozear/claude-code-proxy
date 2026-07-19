@@ -42,6 +42,7 @@ const FALLBACK_TO_CLAUDE_CODE = CONFIG.fallback_to_claude_code !== false; // Def
 
 class ClaudeRequest {
   static cachedToken = null;
+  static cachedTokenIsApiKey = false;
   static presetCache = new Map();
   static refreshPromise = null;
 
@@ -54,6 +55,7 @@ class ClaudeRequest {
       Logger.debug('Using x-api-key as token, replacing cache');
       const token = apiKey.startsWith('Bearer ') ? apiKey : `Bearer ${apiKey}`;
       ClaudeRequest.cachedToken = token;
+      ClaudeRequest.cachedTokenIsApiKey = true;
     }
 
     this.refreshToken = TOKEN_REFRESH_METHOD === 'OAUTH' ? this.refreshTokenWithOauth : this.refreshTokenWithClaudeCodeCli;
@@ -140,12 +142,16 @@ class ClaudeRequest {
   }
 
   async getAuthToken() {
-    if (ClaudeRequest.cachedToken) {
+    // Client-supplied x-api-key tokens have no known expiry; use as-is
+    if (ClaudeRequest.cachedToken && ClaudeRequest.cachedTokenIsApiKey) {
       return ClaudeRequest.cachedToken;
     }
 
+    // OAuth/credential tokens: validate expiry on every request so refresh
+    // happens proactively instead of surfacing as a 401 round-trip
     const token = await this.loadOrRefreshToken();
     ClaudeRequest.cachedToken = token;
+    ClaudeRequest.cachedTokenIsApiKey = false;
     return token;
   }
 
@@ -386,8 +392,9 @@ class ClaudeRequest {
       body.system.push(presetSystemPrompt);
     }
 
-    // Use suffixEt only when thinking is enabled, otherwise use regular suffix
-    const hasThinking = body.thinking && body.thinking.type === 'enabled';
+    // Use suffixEt only when thinking is enabled, otherwise use regular suffix.
+    // Adaptive thinking (Opus/Sonnet 4.6+, Fable 5) counts as thinking too.
+    const hasThinking = body.thinking && (body.thinking.type === 'enabled' || body.thinking.type === 'adaptive');
     const suffix = hasThinking ? preset.suffixEt : preset.suffix;
     
     if (suffix && body.messages && body.messages.length > 0) {
@@ -404,10 +411,9 @@ class ClaudeRequest {
     Logger.debug(`Applied preset: ${presetName}`);
   }
 
-  async makeRequest(body, presetName = null) {
+  async makeRequest(processedBody) {
     const token = await this.getAuthToken();
     const headers = this.getHeaders(token);
-    const processedBody = this.processRequestBody(body, presetName);
 
     Logger.debug('Outgoing headers to Claude:', JSON.stringify(headers, null, 2));
     Logger.debug(`Final request to Claude (${JSON.stringify(processedBody).length} bytes):`, JSON.stringify(processedBody, null, 2));
@@ -438,16 +444,21 @@ class ClaudeRequest {
 
   async handleResponse(res, body, presetName = null) {
     try {
-      const claudeResponse = await this.makeRequest(body, presetName);
-      
+      // Process exactly once: processRequestBody mutates the body (unshifts the
+      // Claude Code system block, splices the preset suffix). Re-processing on
+      // retry duplicated both, shifting the prompt prefix and breaking cache hits.
+      const processedBody = this.processRequestBody(body, presetName);
+      const claudeResponse = await this.makeRequest(processedBody);
+
       if (claudeResponse.statusCode === 401) {
         Logger.info('Got 401, checking credential store');
         ClaudeRequest.cachedToken = null;
-        
+        ClaudeRequest.cachedTokenIsApiKey = false;
+
         try {
           const newToken = await this.loadOrRefreshToken();
           ClaudeRequest.cachedToken = newToken;
-          const retryResponse = await this.makeRequest(body, presetName);
+          const retryResponse = await this.makeRequest(processedBody);
           res.statusCode = retryResponse.statusCode;
           Logger.debug(`Claude API retry status: ${retryResponse.statusCode}`);
           Logger.debug('Claude retry response headers:', JSON.stringify(retryResponse.headers, null, 2));
