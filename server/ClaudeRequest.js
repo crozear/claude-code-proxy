@@ -51,6 +51,11 @@ class ClaudeRequest {
     this.BATCH_URL = 'https://api.anthropic.com/v1/messages/batches';
     this.VERSION = '2023-06-01';
 
+    // Betas the client asked for (prompt caching, task budgets, …). The batch path
+    // used to discard these; keep them so a batched request carries the same
+    // capabilities as the synchronous one.
+    this.clientBetas = String(req?.headers?.['anthropic-beta'] ?? '');
+
     const apiKey = req?.headers?.['x-api-key'];
     if (apiKey && apiKey.includes('sk-ant')) {
       Logger.debug('Using x-api-key as token, replacing cache');
@@ -327,7 +332,11 @@ class ClaudeRequest {
       'Authorization': token,
       'anthropic-version': this.VERSION,
       'User-Agent': 'claude-code-proxy/1.0.0',
-      'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11,task-budgets-2026-03-13'
+      // interleaved-thinking-2025-05-14 and fine-grained-tool-streaming-2025-05-14 are
+      // both GA and inert now; adaptive thinking enables interleaved thinking itself.
+      // claude-code-* and oauth-* are load-bearing for the OAuth path — never send
+      // those on an API-key request.
+      'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11,task-budgets-2026-03-13'
     };
     return headers;
   }
@@ -394,7 +403,8 @@ class ClaudeRequest {
     }
 
     // Use suffixEt only when thinking is enabled, otherwise use regular suffix.
-    // Adaptive thinking (Opus/Sonnet 4.6+, Fable 5) counts as thinking too.
+    // Adaptive thinking (Opus/Sonnet 4.6+, Fable 5) counts as thinking too, while
+    // an explicit `{type: 'disabled'}` deliberately falls through to the plain suffix.
     const hasThinking = body.thinking && (body.thinking.type === 'enabled' || body.thinking.type === 'adaptive');
     const suffix = hasThinking ? preset.suffixEt : preset.suffix;
     
@@ -450,6 +460,21 @@ class ClaudeRequest {
   // billed at 50% of standard token prices, but only on a real API key —
   // OAuth/subscription tokens are not per-token billed.
 
+  // Betas that are only valid on the OAuth / Claude Code path. Sending any of
+  // them alongside an x-api-key is a hard rejection from Anthropic.
+  static OAUTH_ONLY_BETAS = /^(oauth-|claude-code-)/;
+
+  // Merge the betas the client sent with our own, minus the OAuth-only ones.
+  mergeClientBetas(base) {
+    const incoming = this.clientBetas
+      .split(',')
+      .map(beta => beta.trim())
+      .filter(Boolean)
+      .filter(beta => !ClaudeRequest.OAUTH_ONLY_BETAS.test(beta));
+
+    return [...new Set([...base, ...incoming])].join(',');
+  }
+
   getBatchHeaders(token, isApiKey) {
     const headers = {
       'Content-Type': 'application/json',
@@ -460,8 +485,10 @@ class ClaudeRequest {
     if (isApiKey) {
       // Real API key: authenticate with x-api-key and DO NOT send the
       // claude-code/oauth betas (Anthropic rejects those on an API key).
+      // Everything else the client asked for (prompt caching, task budgets)
+      // is merged in rather than overwritten.
       headers['x-api-key'] = token.replace(/^Bearer\s+/i, '');
-      headers['anthropic-beta'] = 'output-300k-2026-03-24';
+      headers['anthropic-beta'] = this.mergeClientBetas(['output-300k-2026-03-24']);
     } else {
       // OAuth/subscription token: mirror the synchronous getHeaders() betas.
       headers['Authorization'] = token;
