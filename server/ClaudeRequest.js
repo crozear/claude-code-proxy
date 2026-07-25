@@ -48,6 +48,7 @@ class ClaudeRequest {
 
   constructor(req = null) {
     this.API_URL = 'https://api.anthropic.com/v1/messages';
+    this.BATCH_URL = 'https://api.anthropic.com/v1/messages/batches';
     this.VERSION = '2023-06-01';
 
     const apiKey = req?.headers?.['x-api-key'];
@@ -440,6 +441,123 @@ class ClaudeRequest {
       req.write(JSON.stringify(processedBody));
       req.end();
     });
+  }
+
+  // ---- Message Batches API ----------------------------------------------
+  // The batch path reuses this class's auth (getAuthToken, incl. the sk-ant
+  // passthrough) and body processing (processRequestBody) so batched requests
+  // are shaped exactly like the synchronous /messages ones. Batch results are
+  // billed at 50% of standard token prices, but only on a real API key —
+  // OAuth/subscription tokens are not per-token billed.
+
+  getBatchHeaders(token, isApiKey) {
+    const headers = {
+      'Content-Type': 'application/json',
+      'anthropic-version': this.VERSION,
+      'User-Agent': 'claude-code-proxy/1.0.0',
+    };
+
+    if (isApiKey) {
+      // Real API key: authenticate with x-api-key and DO NOT send the
+      // claude-code/oauth betas (Anthropic rejects those on an API key).
+      headers['x-api-key'] = token.replace(/^Bearer\s+/i, '');
+      headers['anthropic-beta'] = 'output-300k-2026-03-24';
+    } else {
+      // OAuth/subscription token: mirror the synchronous getHeaders() betas.
+      headers['Authorization'] = token;
+      headers['anthropic-beta'] = 'claude-code-20250219,oauth-2025-04-20,prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11,task-budgets-2026-03-13';
+    }
+
+    return headers;
+  }
+
+  // Generic HTTPS request that buffers the full response as text. Batch
+  // endpoints are JSON (and the results_url is JSONL) — none of them stream.
+  requestRaw(fullUrl, method, headers, bodyString = null) {
+    const urlParts = new URL(fullUrl);
+    const options = {
+      hostname: urlParts.hostname,
+      port: urlParts.port || 443,
+      path: urlParts.pathname + urlParts.search,
+      method,
+      headers,
+    };
+
+    return new Promise((resolve, reject) => {
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: data }));
+      });
+
+      req.on('error', (err) => {
+        req.destroy();
+        reject(err);
+      });
+
+      req.setTimeout(60000, () => {
+        req.destroy();
+        reject(new Error('Batch request timeout'));
+      });
+
+      if (bodyString) req.write(bodyString);
+      req.end();
+    });
+  }
+
+  async createBatch(body, presetName = null) {
+    const token = await this.getAuthToken();
+    const isApiKey = ClaudeRequest.cachedTokenIsApiKey;
+    const headers = this.getBatchHeaders(token, isApiKey);
+
+    const requests = Array.isArray(body?.requests) ? body.requests : [];
+    requests.forEach((entry) => {
+      if (entry && entry.params) {
+        // stream is not allowed inside a batch; each params block gets the same
+        // Claude Code system prompt / preset / sampling treatment as /messages.
+        if ('stream' in entry.params) delete entry.params.stream;
+        entry.params = this.processRequestBody(entry.params, presetName);
+      }
+    });
+
+    const payload = JSON.stringify({ ...body, requests });
+    Logger.debug(`Creating batch (${requests.length} request(s), ${payload.length} bytes)`);
+    return this.requestRaw(this.BATCH_URL, 'POST', headers, payload);
+  }
+
+  async retrieveBatch(id) {
+    const token = await this.getAuthToken();
+    const headers = this.getBatchHeaders(token, ClaudeRequest.cachedTokenIsApiKey);
+    return this.requestRaw(`${this.BATCH_URL}/${id}`, 'GET', headers);
+  }
+
+  async cancelBatch(id) {
+    const token = await this.getAuthToken();
+    const headers = this.getBatchHeaders(token, ClaudeRequest.cachedTokenIsApiKey);
+    return this.requestRaw(`${this.BATCH_URL}/${id}/cancel`, 'POST', headers);
+  }
+
+  async getBatchResults(id) {
+    const retrieve = await this.retrieveBatch(id);
+    let parsed;
+    try {
+      parsed = JSON.parse(retrieve.body);
+    } catch (e) {
+      return retrieve;
+    }
+
+    const resultsUrl = parsed?.results_url;
+    if (!resultsUrl) {
+      return {
+        statusCode: 409,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ error: 'Results not ready', processing_status: parsed?.processing_status ?? null }),
+      };
+    }
+
+    const token = await this.getAuthToken();
+    const headers = this.getBatchHeaders(token, ClaudeRequest.cachedTokenIsApiKey);
+    return this.requestRaw(resultsUrl, 'GET', headers);
   }
 
   async handleResponse(res, body, presetName = null) {

@@ -256,6 +256,68 @@ async function handleRequest(req, res) {
     return;
   }
   
+  // Message Batches API (optionally preset-scoped: /v1/<preset>/messages/batches...)
+  const batchCreate = pathname.match(/^\/v1(?:\/(\w+))?\/messages\/batches$/);
+  const batchCancel = pathname.match(/^\/v1(?:\/(\w+))?\/messages\/batches\/([\w-]+)\/cancel$/);
+  const batchResults = pathname.match(/^\/v1(?:\/(\w+))?\/messages\/batches\/([\w-]+)\/results$/);
+  const batchRetrieve = pathname.match(/^\/v1(?:\/(\w+))?\/messages\/batches\/([\w-]+)$/);
+
+  if (req.method === 'POST' && batchCreate) {
+    try {
+      const presetName = batchCreate[1] || null;
+      const body = await parseBody(req);
+      const result = await new ClaudeRequest(req).createBatch(body, presetName);
+      res.writeHead(result.statusCode, { 'Content-Type': 'application/json' });
+      res.end(result.body);
+      Logger.info(`Batch create → ${result.statusCode}`);
+    } catch (error) {
+      Logger.error('Batch create error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && batchCancel) {
+    try {
+      const result = await new ClaudeRequest(req).cancelBatch(batchCancel[2]);
+      res.writeHead(result.statusCode, { 'Content-Type': 'application/json' });
+      res.end(result.body);
+    } catch (error) {
+      Logger.error('Batch cancel error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && batchResults) {
+    try {
+      const result = await new ClaudeRequest(req).getBatchResults(batchResults[2]);
+      // Results are JSONL (one line per request). Pass through as text.
+      res.writeHead(result.statusCode, { 'Content-Type': result.headers?.['content-type'] || 'application/x-ndjson' });
+      res.end(result.body);
+    } catch (error) {
+      Logger.error('Batch results error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && batchRetrieve) {
+    try {
+      const result = await new ClaudeRequest(req).retrieveBatch(batchRetrieve[2]);
+      res.writeHead(result.statusCode, { 'Content-Type': 'application/json' });
+      res.end(result.body);
+    } catch (error) {
+      Logger.error('Batch retrieve error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
   if (req.method === 'POST' && (pathname === '/v1/messages' || pathname.match(/^\/v1\/\w+\/messages$/))) {
     try {
       Logger.debug('Incoming request headers:', JSON.stringify(req.headers, null, 2));
