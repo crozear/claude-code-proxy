@@ -165,4 +165,66 @@ describe('ClaudeRequest batch methods', () => {
       expect(JSON.parse(result.body).processing_status).toBe('in_progress');
     });
   });
+
+  describe('countTokens', () => {
+    it('forwards the body verbatim to /v1/messages/count_tokens and returns input_tokens', async () => {
+      let captured = null;
+      nock('https://api.anthropic.com')
+        .post('/v1/messages/count_tokens', (body) => { captured = body; return true; })
+        .reply(200, { input_tokens: 14 });
+
+      const cr = new ClaudeRequest();
+      jest.spyOn(cr, 'getAuthToken').mockResolvedValue('Bearer oauth-token');
+
+      const result = await cr.countTokens({
+        model: 'claude-opus-5',
+        messages: [{ role: 'user', content: 'Hello, Claude' }],
+      });
+
+      expect(result.statusCode).toBe(200);
+      expect(JSON.parse(result.body).input_tokens).toBe(14);
+      expect(captured.model).toBe('claude-opus-5');
+      expect(captured.messages).toHaveLength(1);
+    });
+
+    it('does NOT inject the Claude Code system prompt', async () => {
+      // Counting happens per prompt fragment, so a spoof block would add its own
+      // tokens to every single fragment SillyTavern asks about.
+      let captured = null;
+      nock('https://api.anthropic.com')
+        .post('/v1/messages/count_tokens', (body) => { captured = body; return true; })
+        .reply(200, { input_tokens: 5 });
+
+      const cr = new ClaudeRequest();
+      jest.spyOn(cr, 'getAuthToken').mockResolvedValue('Bearer oauth-token');
+
+      await cr.countTokens({
+        model: 'claude-opus-5',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+
+      expect(captured.system).toBeUndefined();
+    });
+
+    it('uses x-api-key with no oauth betas when given a real API key', async () => {
+      let sentHeaders = null;
+      nock('https://api.anthropic.com')
+        .post('/v1/messages/count_tokens')
+        .reply(function () {
+          sentHeaders = this.req.headers;
+          return [200, { input_tokens: 7 }];
+        });
+
+      const cr = new ClaudeRequest({ headers: { 'x-api-key': 'sk-ant-test123' } });
+
+      await cr.countTokens({
+        model: 'claude-fable-5',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+
+      expect(String(sentHeaders['x-api-key'])).toBe('sk-ant-test123');
+      expect(sentHeaders['authorization']).toBeUndefined();
+      expect(String(sentHeaders['anthropic-beta'])).not.toContain('oauth-2025-04-20');
+    });
+  });
 });

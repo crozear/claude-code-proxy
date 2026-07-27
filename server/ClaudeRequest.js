@@ -587,6 +587,18 @@ class ClaudeRequest {
     return this.requestRaw(resultsUrl, 'GET', headers);
   }
 
+  // ---- Token counting ----------------------------------------------------
+  // Free, separately rate limited, and never billed. Deliberately does NOT run
+  // processRequestBody: SillyTavern counts prompt fragments one at a time, and
+  // injecting the Claude Code system block or a preset suffix into each one would
+  // add those tokens to every fragment. Reuses getBatchHeaders purely for the
+  // sk-ant / OAuth beta split.
+  async countTokens(body) {
+    const token = await this.getAuthToken();
+    const headers = this.getBatchHeaders(token, ClaudeRequest.cachedTokenIsApiKey);
+    return this.requestRaw(`${this.API_URL}/count_tokens`, 'POST', headers, JSON.stringify(body));
+  }
+
   async handleResponse(res, body, presetName = null) {
     try {
       // Process exactly once: processRequestBody mutates the body (unshifts the

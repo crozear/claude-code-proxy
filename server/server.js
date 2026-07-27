@@ -318,6 +318,24 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // Token counting (optionally preset-scoped). Must be matched before /v1/messages,
+  // and the preset is intentionally ignored — see ClaudeRequest.countTokens.
+  const countTokens = pathname.match(/^\/v1(?:\/\w+)?\/messages\/count_tokens$/);
+
+  if (req.method === 'POST' && countTokens) {
+    try {
+      const body = await parseBody(req);
+      const result = await new ClaudeRequest(req).countTokens(body);
+      res.writeHead(result.statusCode, { 'Content-Type': 'application/json' });
+      res.end(result.body);
+    } catch (error) {
+      Logger.error('Token count error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
   if (req.method === 'POST' && (pathname === '/v1/messages' || pathname.match(/^\/v1\/\w+\/messages$/))) {
     try {
       Logger.debug('Incoming request headers:', JSON.stringify(req.headers, null, 2));
