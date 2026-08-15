@@ -12,6 +12,10 @@ const OAUTH_CONFIG = {
   scope: 'org:create_api_key user:profile user:inference'
 };
 
+// Treat a token as expired this far ahead of its actual expiry, so a refresh
+// happens before an in-flight request can hit a 401
+const REFRESH_BUFFER_MS = 60000;
+
 class OAuthManager {
   constructor() {
     this.tokenPath = path.join(
@@ -237,7 +241,7 @@ class OAuthManager {
     // Use cached token if available
     if (this.cachedToken) {
       const tokens = this.loadTokens();
-      if (tokens && tokens.expires_at > Date.now() + 60000) { // 1 minute buffer
+      if (tokens && tokens.expires_at > Date.now() + REFRESH_BUFFER_MS) {
         return this.cachedToken;
       }
     }
@@ -247,8 +251,8 @@ class OAuthManager {
       throw new Error('No authentication tokens found. Please authenticate first.');
     }
 
-    // Check if token is expired or expiring soon (1 minute buffer)
-    if (tokens.expires_at <= Date.now() + 60000) {
+    // Check if token is expired or expiring soon
+    if (tokens.expires_at <= Date.now() + REFRESH_BUFFER_MS) {
       Logger.info('Access token expired or expiring soon, refreshing...');
       await this.refreshAccessToken();
       const newTokens = this.loadTokens();
@@ -267,6 +271,20 @@ class OAuthManager {
   isAuthenticated() {
     const tokens = this.loadTokens();
     return !!(tokens && tokens.access_token && tokens.refresh_token);
+  }
+
+  /**
+   * Check whether the stored access token is expired (or expiring within the
+   * refresh buffer). Expired is not the same as unauthenticated: as long as the
+   * refresh token is still good, getValidAccessToken() will mint a new one.
+   * @returns {boolean} True if there is no usable access token right now
+   */
+  isAccessTokenExpired() {
+    const tokens = this.loadTokens();
+    if (!tokens || !tokens.expires_at) {
+      return true;
+    }
+    return tokens.expires_at <= Date.now() + REFRESH_BUFFER_MS;
   }
 
   /**

@@ -226,6 +226,7 @@ async function handleRequest(req, res) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         authenticated: isAuthenticated,
+        access_token_expired: isAuthenticated ? OAuthManager.isAccessTokenExpired() : true,
         expires_at: expiration ? expiration.toISOString() : null
       }));
     } catch (error) {
@@ -378,11 +379,16 @@ function startServer() {
     // Display authentication status
     const isAuthenticated = OAuthManager.isAuthenticated();
     const expiration = OAuthManager.getTokenExpiration();
+    const isExpired = OAuthManager.isAccessTokenExpired();
 
     Logger.info('');
     Logger.info('Authentication Status:');
-    if (isAuthenticated && expiration) {
+    if (isAuthenticated && expiration && !isExpired) {
       Logger.info(`  ✓ Authenticated until ${expiration.toLocaleString()}`);
+    } else if (isAuthenticated && expiration) {
+      // Expired access token is normal after an idle period — the refresh token
+      // is still on disk, so the first request will silently mint a new one
+      Logger.info(`  ↻ Access token expired ${expiration.toLocaleString()} — will refresh on first request`);
     } else {
       Logger.info('  ✗ Not authenticated');
       const authUrl = `http://localhost:${port}/auth/login`;

@@ -625,7 +625,15 @@ class ClaudeRequest {
           this.streamResponse(res, retryResponse);
           return;
         } catch (error) {
-          Logger.info('Token load/refresh failed, passing 401 to client');
+          // Surface the reason — a dead refresh token and a missing tokens.json
+          // are very different problems, and both land here
+          Logger.error(`Token load/refresh failed, passing 401 to client: ${error.message}`);
+
+          // invalid_grant means the refresh token itself is gone, not just the
+          // access token. Nothing recovers this but a new OAuth login.
+          if (/invalid_grant|refresh token expired|no refresh token/i.test(error.message)) {
+            Logger.error('  → Refresh token is no longer valid. Visit /auth/login to re-authenticate.');
+          }
         }
       }
       

@@ -188,6 +188,43 @@ describe('OAuthManager', () => {
     });
   });
 
+  describe('isAccessTokenExpired', () => {
+    it('should return true when no tokens exist', () => {
+      expect(OAuthManager.isAccessTokenExpired()).toBe(true);
+    });
+
+    it('should return false when the token is still valid', () => {
+      OAuthManager.saveTokens({
+        access_token: 'test-access-token',
+        refresh_token: 'test-refresh-token',
+        expires_at: Date.now() + 3600000
+      });
+
+      expect(OAuthManager.isAccessTokenExpired()).toBe(false);
+    });
+
+    it('should return true when the token is past its expiry', () => {
+      OAuthManager.saveTokens({
+        access_token: 'test-access-token',
+        refresh_token: 'test-refresh-token',
+        expires_at: Date.now() - 1000
+      });
+
+      expect(OAuthManager.isAccessTokenExpired()).toBe(true);
+    });
+
+    it('should return true inside the refresh buffer', () => {
+      // 30s out is still "expired" — getValidAccessToken refreshes at 60s
+      OAuthManager.saveTokens({
+        access_token: 'test-access-token',
+        refresh_token: 'test-refresh-token',
+        expires_at: Date.now() + 30000
+      });
+
+      expect(OAuthManager.isAccessTokenExpired()).toBe(true);
+    });
+  });
+
   describe('getTokenExpiration', () => {
     it('should return null when no tokens exist', () => {
       expect(OAuthManager.getTokenExpiration()).toBeNull();
