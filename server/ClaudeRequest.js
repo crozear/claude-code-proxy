@@ -5,6 +5,7 @@ const os = require('os');
 const { execSync } = require('child_process');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
+const OpenAICompat = require('./OpenAICompat');
 
 const STRIP_TTL = false;
 const TOKEN_REFRESH_METHOD = 'OAUTH'; // 'OAUTH' or 'CLAUDE_CODE_CLI'
@@ -40,6 +41,16 @@ const CONFIG = loadConfig();
 const FILTER_SAMPLING_PARAMS = CONFIG.filter_sampling_params === true; // Default to false
 const FALLBACK_TO_CLAUDE_CODE = CONFIG.fallback_to_claude_code !== false; // Default to true
 
+// OpenAI-compatible endpoint defaults. Clients that hardcode /v1/chat/completions
+// usually also hardcode an OpenAI model name and omit max_tokens (which Anthropic
+// requires), so both need a fallback.
+const OPENAI_DEFAULT_MODEL = CONFIG.openai_default_model || OpenAICompat.DEFAULT_MODEL;
+const OPENAI_DEFAULT_MAX_TOKENS = parseInt(CONFIG.openai_default_max_tokens, 10) || OpenAICompat.DEFAULT_MAX_TOKENS;
+// Off by default: OpenAI treats a trailing assistant message as history, and
+// models past Opus 4.6 reject prefill outright. Turn on only to deliberately
+// prefill through the OpenAI route with a model that still allows it.
+const OPENAI_ALLOW_PREFILL = CONFIG.openai_allow_prefill === true;
+
 class ClaudeRequest {
   static cachedToken = null;
   static cachedTokenIsApiKey = false;
@@ -56,12 +67,29 @@ class ClaudeRequest {
     // capabilities as the synchronous one.
     this.clientBetas = String(req?.headers?.['anthropic-beta'] ?? '');
 
+    // Set by handleOpenAIResponse when the client came in through the
+    // OpenAI-compatible route; null means pure Anthropic passthrough.
+    this.openai = null;
+
     const apiKey = req?.headers?.['x-api-key'];
     if (apiKey && apiKey.includes('sk-ant')) {
       Logger.debug('Using x-api-key as token, replacing cache');
       const token = apiKey.startsWith('Bearer ') ? apiKey : `Bearer ${apiKey}`;
       ClaudeRequest.cachedToken = token;
       ClaudeRequest.cachedTokenIsApiKey = true;
+    } else {
+      // OpenAI-shaped clients only have an "API key" field, which they send as
+      // Authorization: Bearer. Accept a real Anthropic API key there; the dummy
+      // placeholder keys those clients often send ("sk-1234", "none") fall
+      // through to the OAuth path, which is the point of this proxy. sk-ant-oat
+      // (OAuth access) tokens are deliberately excluded — they are not API keys
+      // and must keep the OAuth beta headers.
+      const authHeader = req?.headers?.['authorization'];
+      if (authHeader && /sk-ant-api/.test(authHeader)) {
+        Logger.debug('Using Authorization bearer as API key, replacing cache');
+        ClaudeRequest.cachedToken = authHeader.startsWith('Bearer ') ? authHeader : `Bearer ${authHeader}`;
+        ClaudeRequest.cachedTokenIsApiKey = true;
+      }
     }
 
     this.refreshToken = TOKEN_REFRESH_METHOD === 'OAUTH' ? this.refreshTokenWithOauth : this.refreshTokenWithClaudeCodeCli;
@@ -599,6 +627,34 @@ class ClaudeRequest {
     return this.requestRaw(`${this.API_URL}/count_tokens`, 'POST', headers, JSON.stringify(body));
   }
 
+  // ---- OpenAI-compatible entry point -------------------------------------
+  // Translates an OpenAI chat-completions request into an Anthropic one, runs
+  // it through the exact same pipeline as /v1/messages (Claude Code system
+  // block, preset, auth, 401 retry), then translates the reply back. Only the
+  // two edges differ; nothing in the middle knows about OpenAI.
+  async handleOpenAIResponse(res, openaiBody, presetName = null) {
+    const { body, meta } = OpenAICompat.toAnthropicRequest(openaiBody, {
+      defaultModel: OPENAI_DEFAULT_MODEL,
+      defaultMaxTokens: OPENAI_DEFAULT_MAX_TOKENS,
+      allowPrefill: OPENAI_ALLOW_PREFILL,
+    });
+
+    this.openai = meta;
+    Logger.debug(`OpenAI compat: ${meta.requestedModel} -> ${meta.model}, stream=${meta.stream}, ${body.messages.length} message(s)`);
+
+    return this.handleResponse(res, body, presetName);
+  }
+
+  // Upstream headers are copied verbatim on the Anthropic path. On the OpenAI
+  // path the body is rewritten, so the upstream content-length no longer
+  // describes it — sending it truncates the reply.
+  copyUpstreamHeaders(res, upstreamResponse) {
+    Object.keys(upstreamResponse.headers).forEach(key => {
+      if (this.openai && (key === 'content-length' || key === 'content-encoding')) return;
+      res.setHeader(key, upstreamResponse.headers[key]);
+    });
+  }
+
   async handleResponse(res, body, presetName = null) {
     try {
       // Process exactly once: processRequestBody mutates the body (unshifts the
@@ -619,9 +675,7 @@ class ClaudeRequest {
           res.statusCode = retryResponse.statusCode;
           Logger.debug(`Claude API retry status: ${retryResponse.statusCode}`);
           Logger.debug('Claude retry response headers:', JSON.stringify(retryResponse.headers, null, 2));
-          Object.keys(retryResponse.headers).forEach(key => {
-            res.setHeader(key, retryResponse.headers[key]);
-          });
+          this.copyUpstreamHeaders(res, retryResponse);
           this.streamResponse(res, retryResponse);
           return;
         } catch (error) {
@@ -640,16 +694,16 @@ class ClaudeRequest {
       res.statusCode = claudeResponse.statusCode;
       Logger.debug(`Claude API status: ${claudeResponse.statusCode}`);
       Logger.debug('Claude response headers:', JSON.stringify(claudeResponse.headers, null, 2));
-      Object.keys(claudeResponse.headers).forEach(key => {
-        res.setHeader(key, claudeResponse.headers[key]);
-      });
-      
+      this.copyUpstreamHeaders(res, claudeResponse);
+
       this.streamResponse(res, claudeResponse);
-      
+
     } catch (error) {
       console.error('Claude request error:', error.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message }));
+      res.end(JSON.stringify(this.openai
+        ? OpenAICompat.toOpenAIError({ error: { type: 'api_error', message: error.message } }, 500)
+        : { error: error.message }));
     }
   }
 
@@ -676,6 +730,12 @@ class ClaudeRequest {
     };
 
     const contentType = claudeResponse.headers['content-type'] || '';
+
+    if (this.openai) {
+      this.streamOpenAIResponse(res, claudeResponse, contentType, extractClaudeText);
+      return;
+    }
+
     if (contentType.includes('text/event-stream')) {
       Logger.debug('Outgoing response headers to client:', JSON.stringify(res.getHeaders(), null, 2));
       
@@ -752,6 +812,93 @@ class ClaudeRequest {
         }
       });
     }
+  }
+
+  // Mirror of streamResponse for the OpenAI-compatible route: SSE goes through
+  // a translating Transform, JSON gets reshaped once it is buffered. Errors are
+  // reshaped too, since OpenAI clients only know how to display {error:{...}}.
+  streamOpenAIResponse(res, claudeResponse, contentType, extractClaudeText) {
+    const meta = this.openai;
+    const isStream = contentType.includes('text/event-stream');
+
+    if (isStream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      Logger.debug('Outgoing response headers to client:', JSON.stringify(res.getHeaders(), null, 2));
+
+      const translator = OpenAICompat.createStreamTranslator(meta);
+
+      const failStream = (err, label) => {
+        Logger.debug(`${label}:`, err);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(OpenAICompat.toOpenAIError({ error: { message: err.message } }, 500)));
+        } else if (!res.destroyed) {
+          res.end('data: [DONE]\n\n');
+        }
+      };
+
+      claudeResponse.on('error', (err) => failStream(err, 'Claude response stream error'));
+      translator.on('error', (err) => failStream(err, 'OpenAI translation stream error'));
+
+      res.on('close', () => {
+        Logger.debug('Client disconnected, cleaning up streams');
+        if (!claudeResponse.destroyed) claudeResponse.destroy();
+      });
+
+      // The debug stream reads Anthropic SSE, so it stays upstream of the translator.
+      if (Logger.getLogLevel() >= 3) {
+        const debugStream = Logger.createDebugStream('Claude SSE', extractClaudeText);
+        debugStream.on('error', (err) => failStream(err, 'Debug stream error'));
+        claudeResponse.pipe(debugStream).pipe(translator).pipe(res);
+      } else {
+        claudeResponse.pipe(translator).pipe(res);
+      }
+
+      translator.on('end', () => Logger.debug('Translated OpenAI stream sent back to client'));
+      return;
+    }
+
+    res.removeHeader('content-encoding');
+    res.removeHeader('content-length');
+
+    let responseData = '';
+    claudeResponse.on('data', chunk => { responseData += chunk; });
+
+    claudeResponse.on('error', (err) => {
+      Logger.error('Claude non-streaming response error:', err);
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+      }
+      if (!res.destroyed) {
+        res.end(JSON.stringify(OpenAICompat.toOpenAIError({ error: { message: err.message } }, 502)));
+      }
+    });
+
+    claudeResponse.on('end', () => {
+      Logger.debug(`Non-streaming response (${claudeResponse.statusCode}): ${Logger.truncate(responseData)}`);
+      res.setHeader('Content-Type', 'application/json');
+
+      let parsed = null;
+      try {
+        parsed = JSON.parse(responseData);
+      } catch (e) {
+        res.statusCode = claudeResponse.statusCode >= 400 ? claudeResponse.statusCode : 502;
+        res.end(JSON.stringify(OpenAICompat.toOpenAIError(responseData, res.statusCode)));
+        Logger.debug('Unparsable upstream body, sent OpenAI error envelope');
+        return;
+      }
+
+      if (claudeResponse.statusCode >= 400 || parsed.type === 'error') {
+        res.end(JSON.stringify(OpenAICompat.toOpenAIError(parsed, claudeResponse.statusCode)));
+        Logger.debug('Translated upstream error to OpenAI shape');
+        return;
+      }
+
+      res.end(JSON.stringify(OpenAICompat.toOpenAIChatCompletion(parsed, meta)));
+      Logger.debug('Translated OpenAI completion sent back to client');
+    });
   }
 
   async refreshTokenWithClaudeCodeCli() {

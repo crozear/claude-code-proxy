@@ -8,3 +8,9 @@ filter_sampling_params=true  # Set to true to ensure only one sampling parameter
 # OAuth Settings
 auto_open_browser=false  # Disabled for Docker - browser auto-open doesn't work from containers
 fallback_to_claude_code=false  # Use Claude Code credentials as fallback
+
+# OpenAI-compatible endpoints (/v1/chat/completions, /v1/models)
+openai_default_model=claude-sonnet-5  # Used when the client sends a non-Claude model name (gpt-4, etc)
+openai_default_max_tokens=4096  # Used when the client omits max_tokens (Anthropic requires one)
+# openai_models=claude-opus-5,claude-sonnet-5  # Optional: override the /v1/models list
+# openai_allow_prefill=true  # Keep a trailing assistant message as an Anthropic prefill instead of closing with a user turn (Opus 4.6+ rejects prefill)

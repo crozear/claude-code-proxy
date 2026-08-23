@@ -2,3 +2,9 @@ port=42069
 host=
 log_level=DEBUG  # TRACE, DEBUG, INFO, WARN, ERROR
 filter_sampling_params=true  # Set to true to ensure only one sampling parameter is sent (required for Sonnet 4.5 compatibility). Removes default values (1.0) and prefers temperature over top_p when both are non-default.
+
+# OpenAI-compatible endpoints (/v1/chat/completions, /v1/models)
+openai_default_model=claude-sonnet-5  # Used when the client sends a non-Claude model name (gpt-4, etc)
+openai_default_max_tokens=4096  # Used when the client omits max_tokens (Anthropic requires one)
+# openai_models=claude-opus-5,claude-sonnet-5  # Optional: override the /v1/models list
+# openai_allow_prefill=true  # Keep a trailing assistant message as an Anthropic prefill instead of closing with a user turn (Opus 4.6+ rejects prefill)

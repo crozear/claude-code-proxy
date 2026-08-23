@@ -5,7 +5,17 @@ const path = require('path');
 const ClaudeRequest = require('./ClaudeRequest');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
+const OpenAICompat = require('./OpenAICompat');
 const { exec } = require('child_process');
+
+// OpenAI-compatible paths, matched loosely because the clients that need them
+// build the URL themselves. Both accept an optional preset segment and tolerate
+// a doubled /v1 (client appends /v1/chat/completions to a base already ending
+// in /v1). The negative lookahead keeps a stray "v1" out of the preset group.
+//   /chat/completions            /v1/chat/completions      /v1/v1/chat/completions
+//   /v1/pyrite/chat/completions  /pyrite/chat/completions  /v1/pyrite/v1/chat/completions
+const OPENAI_CHAT_ROUTE = /^(?:\/v1)?(?:\/(?!v1(?:\/|$))(\w+))?(?:\/v1)?\/chat\/completions$/;
+const OPENAI_MODELS_ROUTE = /^(?:\/v1)?(?:\/(?!v1(?:\/|$))(\w+))?(?:\/v1)?\/models(?:\/([\w.:-]+))?$/;
 
 let config = {};
 
@@ -358,8 +368,49 @@ async function handleRequest(req, res) {
     }
     return;
   }
-  
-  
+
+  // OpenAI-compatible routes. Clients that can only speak /v1/chat/completions
+  // (game mods, front-ends with a hardcoded OpenAI path) get translated in and
+  // out around the same /v1/messages pipeline.
+  //
+  // The path is matched loosely on purpose: the preset segment is optional, and
+  // a doubled /v1 is tolerated because these clients append their own /v1/...
+  // to whatever base URL the user typed — which is often already .../v1.
+  const chatCompletions = pathname.match(OPENAI_CHAT_ROUTE);
+
+  if (req.method === 'POST' && chatCompletions) {
+    try {
+      Logger.debug('Incoming OpenAI-compatible request headers:', JSON.stringify(req.headers, null, 2));
+      const body = await parseBody(req);
+      Logger.debug(`OpenAI request body (${JSON.stringify(body).length} bytes): ${Logger.truncate(JSON.stringify(body))}`);
+
+      const presetName = chatCompletions[1] || null;
+      if (presetName) Logger.debug(`Detected preset: ${presetName}`);
+
+      await new ClaudeRequest(req).handleOpenAIResponse(res, body, presetName);
+    } catch (error) {
+      Logger.error('OpenAI-compatible request error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(OpenAICompat.toOpenAIError({ error: { message: error.message } }, 500)));
+    }
+    return;
+  }
+
+  const models = pathname.match(OPENAI_MODELS_ROUTE);
+
+  if (req.method === 'GET' && models) {
+    const modelId = models[2];
+    const configured = config.openai_models
+      ? config.openai_models.split(',').map(m => m.trim()).filter(Boolean)
+      : undefined;
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(modelId
+      ? OpenAICompat.toModelObject(modelId)
+      : OpenAICompat.toModelList(configured)));
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 }

@@ -34,9 +34,44 @@ If you already have Claude Code installed and prefer to use its credentials:
 2. Visit `http://localhost:42069/auth/login` to authenticate
 
 **Important Notes:**
-- NOT an OpenAI compatible proxy, uses Anthropic's schema
+- Natively an Anthropic-schema proxy. There is also an OpenAI-compatible front door (`/v1/chat/completions`) for clients that can't speak Anthropic — see below
 - Only exact dated model names of Sonnet 4, 3.7, 3.6, and Haiku 3.5 are allowed. Opus 4 too with Max.
 - Understand your front end's caching, some FEs like ST disable by default, complex RP setups may consistently miss cache and increase costs
+
+## OpenAI-compatible endpoints
+
+For clients that hardcode an OpenAI path (game mods, most generic "AI" integrations), the proxy accepts
+OpenAI chat-completions requests, translates them to Anthropic on the way in, and translates the reply
+back on the way out. Everything in between — auth, the Claude Code system block, presets, the 401 retry —
+is the same pipeline `/v1/messages` uses.
+
+Point the client's base URL at the proxy and leave whatever else it wants to append:
+
+```
+POST  /v1/chat/completions          POST  /chat/completions
+POST  /v1/<preset>/chat/completions POST  /<preset>/chat/completions
+GET   /v1/models                    GET   /models
+```
+
+A doubled `/v1` is tolerated too (`/v1/v1/chat/completions`), since these clients append their own
+`/v1/...` to whatever base URL you typed — which is usually already `.../v1`.
+
+What's handled:
+
+- **Streaming and non-streaming.** `stream: true` comes back as `chat.completion.chunk` SSE terminated by `data: [DONE]`; otherwise a normal `chat.completion` object
+- **Model names.** Anything starting with `claude` passes through untouched. Common OpenAI names (`gpt-4`, `gpt-4o`, …) map to a Claude equivalent, and anything else unknown falls back to `openai_default_model` in `server/config.txt`
+- **`max_tokens`.** Anthropic requires it and OpenAI clients often omit it, so `openai_default_max_tokens` (4096) fills in
+- **Messages.** `system`/`developer` turns are hoisted into Anthropic's top-level `system`, consecutive same-role turns are merged, and the conversation is made to both start and end on a user turn — all things Anthropic requires but OpenAI doesn't. A conversation ending on an assistant turn gets a `(Continue.)` user turn appended, because Anthropic reads a trailing assistant turn as a *prefill* and models past Opus 4.6 refuse it outright (`This model does not support assistant message prefill`). Set `openai_allow_prefill=true` in `server/config.txt` if you actually want prefill behavior here. None of this touches the native `/v1/messages` path
+- **Tools.** `tools`/`tool_calls`/`role: "tool"` convert to Anthropic `tools`/`tool_use`/`tool_result` and back, including streamed argument deltas
+- **Images** (`image_url`, data-URL or https), **`stop`** → `stop_sequences`, **`response_format: json_object`** → a system instruction, **`reasoning_effort`** → a thinking budget
+- **Sampling.** `temperature` is clamped to Anthropic's 0–1. OpenAI-only fields Anthropic rejects (`n`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `seed`, `user`, `logprobs`) are dropped
+- **Errors** come back in the OpenAI `{"error": {...}}` envelope so the client displays them instead of choking
+- **Auth.** These clients usually only have an "API key" field, which they send as `Authorization: Bearer`. A real Anthropic key there (`sk-ant-api...`) is used as-is; the dummy placeholders they often send (`sk-1234`, `none`) are ignored so the request falls through to your OAuth subscription auth, which is the point of this proxy
+
+Thinking output is returned as `reasoning_content` (the DeepSeek convention) — clients that don't know
+the field simply ignore it.
+
+Not implemented: the legacy `/v1/completions` text-completion endpoint, and `n > 1`.
 
 ## Authentication
 

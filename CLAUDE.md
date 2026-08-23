@@ -29,17 +29,20 @@ Verify edits with `node --check server/<file>.js`.
 
 ### Test suite state
 
-`npx jest` currently reports **2 pre-existing failures in `server/ClaudeRequest.test.js`** (`TypeError: res.writeHead is not a function` — the test's `PassThrough`-based mock `res` lacks `writeHead`, so any throw inside `handleResponse` surfaces as this instead of the real error). 46 of 48 pass. Confirm against a clean checkout before chasing them; if you see a *third* failure, that one is yours.
+`npx jest` currently reports **2 pre-existing failures in `server/ClaudeRequest.test.js`** (`TypeError: res.writeHead is not a function`). The real error is `Logger.truncate is not a function` — that file's `jest.mock('./Logger')` omits `truncate`, which `makeRequest` calls, and the test's `PassThrough`-based mock `res` lacks `writeHead`, so the throw surfaces as the `writeHead` TypeError instead. Adding `truncate: (v) => String(v)` and a `writeHead` stub to that file's mocks fixes both (verified); left alone as out-of-scope. 82 of 84 pass. Confirm against a clean checkout before chasing them; if you see a *third* failure, that one is yours.
+
+Dev deps are **not** committed — `npm install` first or every suite fails with `Cannot find module 'nock'`.
 
 ## Architecture
 
-Three files do everything:
+Four files do everything:
 
 | File | Role |
 |------|------|
 | `server/server.js` | Plain `http.createServer` — routing is a linear chain of `pathname.match(...)` / `if` blocks in `handleRequest`, no Express, no router lib. Also owns the PKCE state map and Docker/host detection. |
 | `server/ClaudeRequest.js` | All request mutation, auth-token resolution, upstream HTTPS calls, streaming passthrough, presets, batch API. One instance per inbound request; auth cache is `static`. |
 | `server/OAuthManager.js` | Singleton. PKCE generation, code exchange, refresh, `~/.claude-code-proxy/tokens.json` persistence. |
+| `server/OpenAICompat.js` | Pure OpenAI ⇄ Anthropic translation for the `/v1/chat/completions` front door. No HTTP, no auth, no config reads — just body/response/SSE reshaping. |
 
 `server/Logger.js` is a static class configured from `config.txt`; `Logger.createDebugStream()` is a `Transform` that sits in the SSE pipe at `log_level=DEBUG` to accumulate and frame the reply into one bounded log line (see the comment there about Docker's 16 KB line-splitting — don't reintroduce raw token echoing to stdout).
 
@@ -52,13 +55,27 @@ Three files do everything:
 3. On **401**: clears the static token cache, `loadOrRefreshToken()`, retries **the already-processed body**. Processing exactly once is load-bearing — re-processing duplicated the system block and the preset suffix, shifting the prompt prefix and killing cache hits. `ClaudeRequest.test.js` asserts the two bodies are byte-identical.
 4. `streamResponse()` branches on upstream `content-type`: `text/event-stream` → pipe straight through (plus the debug stream at DEBUG); otherwise buffer, `removeHeader('content-encoding')`, re-serialize JSON.
 
-Upstream response headers are copied verbatim to the client.
+Upstream response headers are copied verbatim to the client via `copyUpstreamHeaders()` — except on the OpenAI path, where `content-length` and `content-encoding` are dropped because the body gets rewritten.
+
+### OpenAI-compatible route
+
+`POST /v1/chat/completions` (and `/chat/completions`, `/v1/<preset>/chat/completions`, plus a tolerated doubled `/v1`) → `new ClaudeRequest(req).handleOpenAIResponse(res, body, presetName)`, which translates the request and then calls **the same `handleResponse`** — so auth, the Claude Code system block, presets and the 401 retry are shared, not duplicated. Only the two edges differ:
+
+- **In**: `OpenAICompat.toAnthropicRequest()` returns `{ body, meta }` and the meta is stashed on `this.openai`. That flag is the *only* thing distinguishing the two paths downstream.
+- **Out**: `streamResponse()` short-circuits to `streamOpenAIResponse()` when `this.openai` is set. SSE goes through `createStreamTranslator()` (a `Transform`, placed **after** the debug stream so DEBUG still logs Anthropic events); JSON is buffered and reshaped; upstream errors become the OpenAI `{error:{...}}` envelope.
+
+The request body is built as a **whitelist**, not a spread — Anthropic rejects unknown top-level fields, so `n`/`presence_penalty`/`seed`/etc. are dropped by never being copied. `GET /v1/models` (and `/models`, `/v1/models/<id>`) answers discovery probes from `KNOWN_MODELS`, overridable with `openai_models` in config.
+
+Anthropic's message rules are stricter than OpenAI's, and `normalizeMessages()` exists entirely to bridge that: merge consecutive same-role turns, force a leading user turn, drop empty/blank blocks, and **close the conversation with a user turn**. Don't "simplify" it away.
+
+That last rule is the non-obvious one. A trailing assistant turn means *prefill* to Anthropic but *plain history* to OpenAI, and models past Opus 4.6 reject prefill outright (`This model does not support assistant message prefill. The conversation must end with a user message.`). Clients that keep their state in system messages and send an assistant-only history — game mods do this constantly — hit that on every request, so a `(Continue.)` user turn is appended. `openai_allow_prefill=true` restores the Anthropic reading, and only then does the trailing-whitespace trim matter (Anthropic rejects trailing whitespace on a prefill). The native `/v1/messages` path is untouched by any of this — ST's prefill still works exactly as before.
 
 ### Auth precedence
 
 `getAuthToken()` resolves in this order:
 
 1. **`x-api-key` header containing `sk-ant`** — set in the constructor, cached in the `static cachedToken` with `cachedTokenIsApiKey = true`, used as-is (no expiry checking). In SillyTavern this is the "Proxy Password" field.
+1b. **`Authorization: Bearer` matching `sk-ant-api`** — only when there's no `x-api-key`, for OpenAI-shaped clients that only have an "API key" field. Deliberately narrower than the `x-api-key` check: `sk-ant-oat*` (OAuth access) tokens must **not** be flagged as API keys or they lose the OAuth betas, and the dummy keys these clients send (`sk-1234`) must fall through to OAuth.
 2. **OAuth tokens** — `~/.claude-code-proxy/tokens.json` via `OAuthManager.getValidAccessToken()` (auto-refreshes with a 1-minute buffer).
 3. **Claude Code credentials** — `~/.claude/.credentials.json`, only when `fallback_to_claude_code` isn't `false`. On Windows it tries the native path first, then `wsl cat ~/.claude/.credentials.json`.
 
@@ -68,7 +85,7 @@ Note the caches are **static/process-wide**: one client sending an `sk-ant` key 
 
 ### Preset-scoped URLs
 
-Every route exists in a bare form and a preset-scoped form — `/v1/messages` and `/v1/<preset>/messages`, `/v1/messages/batches` and `/v1/<preset>/messages/batches`. **When adding a route, match both.** `<preset>` names a file in `server/presets/` (e.g. `/v1/pyrite` → `presets/pyrite.json`), loaded lazily into `presetCache` — a failed load caches `null` so it isn't retried.
+Every route exists in a bare form and a preset-scoped form — `/v1/messages` and `/v1/<preset>/messages`, `/v1/messages/batches` and `/v1/<preset>/messages/batches`, `/v1/chat/completions` and `/v1/<preset>/chat/completions`. **When adding a route, match both.** `<preset>` names a file in `server/presets/` (e.g. `/v1/pyrite` → `presets/pyrite.json`), loaded lazily into `presetCache` — a failed load caches `null` so it isn't retried. Note the checked-in `pyrite.json` currently has **empty strings** for all three fields, so applying it is a no-op; use a scratch preset when testing that presets apply.
 
 Preset JSON shape: `{ system, suffix, suffixEt }`. `system` is appended as an extra system block; the suffix is spliced in as a `user` message **immediately after the last user message**, and `suffixEt` is used instead when thinking is on (`body.thinking.type === 'enabled' | 'adaptive'`).
 
@@ -87,8 +104,10 @@ Preset JSON shape: `{ system, suffix, suffixEt }`. `system` is appended as an ex
 
 - `port` (default 3000 in code, 42069 in configs), `host` (blank = auto: `127.0.0.1` native, `0.0.0.0` in Docker via `/.dockerenv` + cgroup detection)
 - `log_level` — `TRACE|DEBUG|INFO|WARN|ERROR`; `DEBUG` dumps full request/response bodies
-- `filter_sampling_params` — when true, drops one of `temperature`/`top_p` (Sonnet 4.5 rejects both); removes defaults of `1.0`, prefers temperature when both are non-default
+- `filter_sampling_params` — when true, drops one of `temperature`/`top_p` (Sonnet 4.5 rejects both); removes defaults of `1.0`, prefers temperature when both are non-default. Note this also eats an OpenAI `temperature` that clamped to exactly `1.0`
 - `auto_open_browser`, `fallback_to_claude_code`
+- `openai_default_model` / `openai_default_max_tokens` — fallbacks for the OpenAI route when the client sends a non-Claude model name or omits `max_tokens`; read at module load like the other `ClaudeRequest.js` flags. `openai_models` (read by `server.js`, so live) overrides the `/v1/models` list
+- `openai_allow_prefill` — default false; see the OpenAI route section. Only affects `/v1/chat/completions`
 
 Two module-level constants in `ClaudeRequest.js` are **not** config-driven: `STRIP_TTL` (currently `false`, so `cache_control.ttl` passes through despite the README saying it's stripped) and `TOKEN_REFRESH_METHOD` (`'OAUTH'`; the `CLAUDE_CODE_CLI` path throws).
 
@@ -97,6 +116,8 @@ Two module-level constants in `ClaudeRequest.js` are **not** config-driven: `STR
 - `nock` intercepts `https://api.anthropic.com`. Header values come back as **strings, not arrays** — assert `String(headers['x-api-key'])`.
 - `server/Logger` is `jest.mock`'d at the top of every test file (with `getLogLevel: () => 0`) — required, since `ClaudeRequest` calls `Logger.truncate`/`createDebugStream` on hot paths.
 - **`server/server.test.js` re-implements its own copy of `handleRequest` rather than importing `server.js`** — it has already drifted (its `/auth/login` returns a 302 while the real server serves `static/login.html`). Passing OAuth route tests do not mean `server.js` routing works; add integration coverage against the real handler if you touch routing.
+- `server.js` exports only `startServer`, not `handleRequest`, so end-to-end route coverage means booting the real server. The trick that works: copy `server/` to a scratch dir, rewrite `port` in its `config.txt` (the port comes from config, **not** an argument — mismatch it and you get a silent connection refusal), `require(copy + '/server.js').startServer()` **in the same process** as the `nock` interceptors, then hit `127.0.0.1:<port>` over real HTTP. Send `x-api-key: sk-ant-api03-...` to skip the OAuth path entirely.
+- `server/OpenAICompat.test.js` covers the translation layer as pure functions plus `handleOpenAIResponse` end-to-end through `nock`; its mock `res` is a `PassThrough` with `writeHead`/`getHeader`/`removeHeader` added, which is the mock the older files should have had.
 - `OAuthManager` is a singleton, so tests override `OAuthManager.tokenPath` to a `.test-tokens*` dir and reset `cachedToken`.
 
 ## Other directories
